@@ -3,6 +3,48 @@
 This format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.41.1](https://github.com/flipt-io/flipt/releases/tag/v1.41.1) - 2024-05-01
+
+### Fixed
+
+- `breaking`: sampling ratio yaml config (#3034)
+
+## [v1.41.0](https://github.com/flipt-io/flipt/releases/tag/v1.41.0) - 2024-04-30
+
+### Added
+
+- add semver constraint for git storage (#2977)
+- OTLP metrics exporter (#3021)
+- `authn`: allow validation of jwt subject claim (#2995)
+- improve open telemetry tracing instrumentation (#2984)
+- `config`: support remote blob storage for service configuration (#2983)
+
+### Changed
+
+- `storage`: move from lib/pq to pgx (#2996)
+
+### Fixed
+
+- `cmd/grpc`: skip eval data service when evaluation API auth excluded (#3018)
+
+## [v1.40.2](https://github.com/flipt-io/flipt/releases/tag/v1.40.2) - 2024-04-23
+
+### Fixed
+
+- `cmd/grpc`: skip eval data service when evaluation API auth excluded (#3018)
+
+## [v1.40.1](https://github.com/flipt-io/flipt/releases/tag/v1.40.1) - 2024-04-11
+
+### Changed
+
+- add halcyonCorsair as a contributor for code (#2970)
+
+### Fixed
+
+- only store auth hash in cache (#2974)
+- `auth`: skip establishing a database connection when not necessary (#2973)
+- `cache`: accept a username in redis configuration (#2953)
+
 ## [v1.40.0](https://github.com/flipt-io/flipt/releases/tag/v1.40.0) - 2024-04-05
 
 ### Added

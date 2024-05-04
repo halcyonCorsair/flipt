@@ -10,6 +10,10 @@ import (
 	"sync"
 	"time"
 
+	otlpRuntime "go.opentelemetry.io/contrib/instrumentation/runtime"
+
+	"go.opentelemetry.io/contrib/propagators/autoprop"
+
 	sq "github.com/Masterminds/squirrel"
 	"go.flipt.io/flipt/internal/cache"
 	"go.flipt.io/flipt/internal/cache/memory"
@@ -17,6 +21,7 @@ import (
 	"go.flipt.io/flipt/internal/config"
 	"go.flipt.io/flipt/internal/containers"
 	"go.flipt.io/flipt/internal/info"
+	"go.flipt.io/flipt/internal/metrics"
 	fliptserver "go.flipt.io/flipt/internal/server"
 	analytics "go.flipt.io/flipt/internal/server/analytics"
 	"go.flipt.io/flipt/internal/server/analytics/clickhouse"
@@ -39,7 +44,7 @@ import (
 	"go.flipt.io/flipt/internal/tracing"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
+	metricsdk "go.opentelemetry.io/otel/sdk/metric"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -149,9 +154,42 @@ func NewGRPCServer(
 
 	logger.Debug("store enabled", zap.Stringer("store", store))
 
+	// Initialize metrics exporter if enabled
+	if cfg.Metrics.Enabled {
+		metricsResource, err := metrics.GetResources(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("creating metrics resource: %w", err)
+		}
+
+		metricExp, metricExpShutdown, err := metrics.GetExporter(ctx, &cfg.Metrics)
+		if err != nil {
+			return nil, fmt.Errorf("creating metrics exporter: %w", err)
+		}
+
+		server.onShutdown(metricExpShutdown)
+
+		meterProvider := metricsdk.NewMeterProvider(
+			metricsdk.WithResource(metricsResource),
+			metricsdk.WithReader(metricExp),
+		)
+		otel.SetMeterProvider(meterProvider)
+		server.onShutdown(meterProvider.Shutdown)
+
+		// We only want to start the runtime metrics by open telemetry if the user have chosen
+		// to use OTLP because the Prometheus endpoint already exposes those metrics.
+		if cfg.Metrics.Exporter == config.MetricsOTLP {
+			err = otlpRuntime.Start(otlpRuntime.WithMeterProvider(meterProvider))
+			if err != nil {
+				return nil, fmt.Errorf("starting runtime metric exporter: %w", err)
+			}
+		}
+
+		logger.Debug("otel metrics enabled", zap.String("exporter", string(cfg.Metrics.Exporter)))
+	}
+
 	// Initialize tracingProvider regardless of configuration. No extraordinary resources
 	// are consumed, or goroutines initialized until a SpanProcessor is registered.
-	tracingProvider, err := tracing.NewProvider(ctx, info.Version)
+	tracingProvider, err := tracing.NewProvider(ctx, info.Version, cfg.Tracing)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +264,7 @@ func NewGRPCServer(
 
 	skipAuthIfExcluded(fliptsrv, cfg.Authentication.Exclude.Management)
 	skipAuthIfExcluded(evalsrv, cfg.Authentication.Exclude.Evaluation)
+	skipAuthIfExcluded(evalDataSrv, cfg.Authentication.Exclude.Evaluation)
 
 	var checker *audit.Checker
 
@@ -373,7 +412,12 @@ func NewGRPCServer(
 	})
 
 	otel.SetTracerProvider(tracingProvider)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+
+	textMapPropagator, err := autoprop.TextMapPropagator(getStringSlice(cfg.Tracing.Propagators)...)
+	if err != nil {
+		return nil, fmt.Errorf("error constructing tracing text map propagator: %w", err)
+	}
+	otel.SetTextMapPropagator(textMapPropagator)
 
 	grpcOpts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(interceptors...),
@@ -550,4 +594,16 @@ func getDB(ctx context.Context, logger *zap.Logger, cfg *config.Config, forceMig
 	})
 
 	return db, builder, driver, dbFunc, dbErr
+}
+
+// getStringSlice receives any slice which the underline member type is "string"
+// and return a new slice with the same members but transformed to "string" type.
+// This is useful when we want to convert an enum slice of strings.
+func getStringSlice[AnyString ~string, Slice []AnyString](slice Slice) []string {
+	strSlice := make([]string, 0, len(slice))
+	for _, anyString := range slice {
+		strSlice = append(strSlice, string(anyString))
+	}
+
+	return strSlice
 }

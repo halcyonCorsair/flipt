@@ -1,22 +1,27 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/iancoleman/strcase"
 	"github.com/santhosh-tekuri/jsonschema/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.flipt.io/flipt/internal/oci"
+	"gocloud.dev/blob"
+	"gocloud.dev/blob/memblob"
 	"gopkg.in/yaml.v2"
 )
 
@@ -320,6 +325,27 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
+			name: "metrics disabled",
+			path: "./testdata/metrics/disabled.yml",
+			expected: func() *Config {
+				cfg := Default()
+				cfg.Metrics.Enabled = false
+				return cfg
+			},
+		},
+		{
+			name: "metrics OTLP",
+			path: "./testdata/metrics/otlp.yml",
+			expected: func() *Config {
+				cfg := Default()
+				cfg.Metrics.Enabled = true
+				cfg.Metrics.Exporter = MetricsOTLP
+				cfg.Metrics.OTLP.Endpoint = "http://localhost:9999"
+				cfg.Metrics.OTLP.Headers = map[string]string{"api-key": "test-key"}
+				return cfg
+			},
+		},
+		{
 			name: "tracing zipkin",
 			path: "./testdata/tracing/zipkin.yml",
 			expected: func() *Config {
@@ -331,10 +357,21 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
-			name: "tracing otlp",
+			name:    "tracing with wrong sampling ration",
+			path:    "./testdata/tracing/wrong_sampling_ratio.yml",
+			wantErr: errors.New("sampling ratio should be a number between 0 and 1"),
+		},
+		{
+			name:    "tracing with wrong propagator",
+			path:    "./testdata/tracing/wrong_propagator.yml",
+			wantErr: errors.New("invalid propagator option: wrong_propagator"),
+		},
+		{
+			name: "tracing OTLP",
 			path: "./testdata/tracing/otlp.yml",
 			expected: func() *Config {
 				cfg := Default()
+				cfg.Tracing.SamplingRatio = 0.5
 				cfg.Tracing.Enabled = true
 				cfg.Tracing.Exporter = TracingOTLP
 				cfg.Tracing.OTLP.Endpoint = "http://localhost:9999"
@@ -577,8 +614,13 @@ func TestLoad(t *testing.T) {
 					CertKey:   "./testdata/ssl_key.pem",
 				}
 				cfg.Tracing = TracingConfig{
-					Enabled:  true,
-					Exporter: TracingOTLP,
+					Enabled:       true,
+					Exporter:      TracingOTLP,
+					SamplingRatio: 1,
+					Propagators: []TracingPropagator{
+						TracingPropagatorTraceContext,
+						TracingPropagatorBaggage,
+					},
 					Jaeger: JaegerTracingConfig{
 						Host: "localhost",
 						Port: 6831,
@@ -595,6 +637,7 @@ func TestLoad(t *testing.T) {
 					Git: &Git{
 						Repository:   "https://github.com/flipt-io/flipt.git",
 						Ref:          "production",
+						RefType:      GitRefTypeStatic,
 						PollInterval: 5 * time.Second,
 						Authentication: Authentication{
 							BasicAuth: &BasicAuth{
@@ -732,6 +775,7 @@ func TestLoad(t *testing.T) {
 					Type: GitStorageType,
 					Git: &Git{
 						Ref:          "main",
+						RefType:      GitRefTypeStatic,
 						Repository:   "git@github.com:foo/bar.git",
 						PollInterval: 30 * time.Second,
 					},
@@ -748,6 +792,25 @@ func TestLoad(t *testing.T) {
 					Type: GitStorageType,
 					Git: &Git{
 						Ref:          "main",
+						RefType:      GitRefTypeStatic,
+						Repository:   "git@github.com:foo/bar.git",
+						Directory:    "baz",
+						PollInterval: 30 * time.Second,
+					},
+				}
+				return cfg
+			},
+		},
+		{
+			name: "git config provided with ref_type",
+			path: "./testdata/storage/git_provided_with_ref_type.yml",
+			expected: func() *Config {
+				cfg := Default()
+				cfg.Storage = StorageConfig{
+					Type: GitStorageType,
+					Git: &Git{
+						Ref:          "main",
+						RefType:      GitRefTypeSemver,
 						Repository:   "git@github.com:foo/bar.git",
 						Directory:    "baz",
 						PollInterval: 30 * time.Second,
@@ -760,6 +823,11 @@ func TestLoad(t *testing.T) {
 			name:    "git repository not provided",
 			path:    "./testdata/storage/invalid_git_repo_not_specified.yml",
 			wantErr: errors.New("git repository must be specified"),
+		},
+		{
+			name:    "git invalid ref_type provided",
+			path:    "./testdata/storage/git_invalid_ref_type.yml",
+			wantErr: errors.New("invalid git storage reference type"),
 		},
 		{
 			name:    "git basic auth partially provided",
@@ -790,6 +858,7 @@ func TestLoad(t *testing.T) {
 					Type: GitStorageType,
 					Git: &Git{
 						Ref:          "main",
+						RefType:      GitRefTypeStatic,
 						Repository:   "git@github.com:foo/bar.git",
 						PollInterval: 30 * time.Second,
 						Authentication: Authentication{
@@ -1350,4 +1419,152 @@ func Test_mustBindEnv(t *testing.T) {
 			assert.Equal(t, test.bound, []string(binder))
 		})
 	}
+}
+
+type mockURLOpener struct {
+	bucket *blob.Bucket
+}
+
+// OpenBucketURL opens a blob.Bucket based on u.
+func (c *mockURLOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, error) {
+	for param := range u.Query() {
+		return nil, fmt.Errorf("open bucket %v: invalid query parameter %q", u, param)
+	}
+	return c.bucket, nil
+}
+
+func TestGetConfigFile(t *testing.T) {
+	blob.DefaultURLMux().RegisterBucket("mock", &mockURLOpener{
+		bucket: memblob.OpenBucket(nil),
+	})
+	configData := []byte("some config data")
+	ctx := context.Background()
+	b, err := blob.OpenBucket(ctx, "mock://mybucket")
+	require.NoError(t, err)
+	t.Cleanup(func() { b.Close() })
+	w, err := b.NewWriter(ctx, "config/local.yml", nil)
+	require.NoError(t, err)
+	_, err = w.Write(configData)
+	require.NoError(t, err)
+	err = w.Close()
+	require.NoError(t, err)
+	t.Run("successful", func(t *testing.T) {
+		f, err := getConfigFile(ctx, "mock://mybucket/config/local.yml")
+		require.NoError(t, err)
+		s, err := f.Stat()
+		require.NoError(t, err)
+		require.Equal(t, "local.yml", s.Name())
+
+		data, err := io.ReadAll(f)
+		require.NoError(t, err)
+		require.Equal(t, configData, data)
+	})
+
+	for _, tt := range []struct {
+		name string
+		path string
+	}{
+		{"unknown bucket", "mock://otherbucket/config.yml"},
+		{"unknown scheme", "unknown://otherbucket/config.yml"},
+		{"no bucket", "mock://"},
+		{"no key", "mock://mybucket"},
+		{"no data", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err = getConfigFile(ctx, tt.path)
+			require.Error(t, err)
+		})
+	}
+}
+
+var (
+	// add any struct tags to match their camelCase equivalents here.
+	camelCaseMatchers = map[string]string{
+		"requireTLS":   "requireTLS",
+		"discoveryURL": "discoveryURL",
+	}
+)
+
+func TestStructTags(t *testing.T) {
+	configType := reflect.TypeOf(Config{})
+	configTags := getStructTags(configType)
+
+	for k, v := range camelCaseMatchers {
+		strcase.ConfigureAcronym(k, v)
+	}
+
+	// Validate the struct tags for the Config struct.
+	// recursively validate the struct tags for all sub-structs.
+	validateStructTags(t, configTags, configType)
+}
+
+func validateStructTags(t *testing.T, tags map[string]map[string]string, tType reflect.Type) {
+	tName := tType.Name()
+	for fieldName, fieldTags := range tags {
+		fieldType, ok := tType.FieldByName(fieldName)
+		require.True(t, ok, "field %s not found in type %s", fieldName, tName)
+
+		// Validate the `json` struct tag.
+		jsonTag, ok := fieldTags["json"]
+		if ok {
+			require.True(t, isCamelCase(jsonTag), "json tag for field '%s.%s' should be camelCase but is '%s'", tName, fieldName, jsonTag)
+		}
+
+		// Validate the `mapstructure` struct tag.
+		mapstructureTag, ok := fieldTags["mapstructure"]
+		if ok {
+			require.True(t, isSnakeCase(mapstructureTag), "mapstructure tag for field '%s.%s' should be snake_case but is '%s'", tName, fieldName, mapstructureTag)
+		}
+
+		// Validate the `yaml` struct tag.
+		yamlTag, ok := fieldTags["yaml"]
+		if ok {
+			require.True(t, isSnakeCase(yamlTag), "yaml tag for field '%s.%s' should be snake_case but is '%s'", tName, fieldName, yamlTag)
+		}
+
+		// recursively validate the struct tags for all sub-structs.
+		if fieldType.Type.Kind() == reflect.Struct {
+			validateStructTags(t, getStructTags(fieldType.Type), fieldType.Type)
+		}
+	}
+}
+
+func isCamelCase(s string) bool {
+	return s == strcase.ToLowerCamel(s)
+}
+
+func isSnakeCase(s string) bool {
+	return s == strcase.ToSnake(s)
+}
+
+func getStructTags(t reflect.Type) map[string]map[string]string {
+	tags := make(map[string]map[string]string)
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+
+		// Get the field name.
+		fieldName := field.Name
+
+		// Get the field tags.
+		fieldTags := make(map[string]string)
+		for _, tag := range []string{"json", "mapstructure", "yaml"} {
+			tagValue := field.Tag.Get(tag)
+			if tagValue == "-" {
+				fieldTags[tag] = "skip"
+				continue
+			}
+			values := strings.Split(tagValue, ",")
+			if len(values) > 1 {
+				tagValue = values[0]
+			}
+			if tagValue != "" {
+				fieldTags[tag] = tagValue
+			}
+		}
+
+		tags[fieldName] = fieldTags
+	}
+
+	return tags
 }
